@@ -46,6 +46,9 @@ After a typhoon or flood event, how many days until root-zone soil moisture retu
 - **"Raw" data** means as delivered by NASA, restricted to the Luzon box. The cut is made right after reading.
 - **UTC days** are used for both datasets. Manila's midnight (16:00 UTC) falls in the middle of a 3-hour SMAP window, so it cannot be cut cleanly.
 - **SMAP day filter:** keep a granule only if its start time falls on the target date. Searching by date range also returns the previous day's last window.
+- **Land mask:** SMAP water cells hold the fill value -9999, so land cells are the ones that are not -9999. The mask is built once, because the grid is the same in every file.
+- **Output granularity:** one file per day in `raw/`, to avoid thousands of tiny files that slow Athena down. A consolidated layer in `processed/` is planned.
+- **Output file format:** not decided yet. Parquet (one row per cell per timestamp) is the leading option, because Athena and Glue read it natively.
 
 ## Updates
 
@@ -74,9 +77,29 @@ Set up the bucket prefixes and ran a pilot search for one day of Typhoon Vamco (
 
 **Next:** find the Luzon grid cells once from `cell_lat` and `cell_lon`, check whether `sm_rootzone_pctl` is useful for the seasonal baseline, time the read of one granule, then time a full event window.
 
+### Checkpoint 3
+
+Finished the pilot reads for both datasets on one day of Typhoon Vamco, in AWS CloudShell, and worked out the Luzon windows.
+
+**Results**
+
+- **SMAP window:** the Luzon box is a clean rectangle on the grid (rows 553 to 619, columns 3208 to 3241), so 67 x 34 = 2,278 cells. Of these, 1,354 hold valid data, which matches the earlier land-cell count. The remaining cells are water.
+- **SMAP read time:** about 1 second for the four variables (`sm_surface`, `sm_rootzone`, `sm_surface_wetness`, `sm_rootzone_wetness`), plus about 0.7 seconds to open the file. Mean root-zone wetness for the Nov 11 22:30 UTC window was 0.944, consistent with the earlier peak.
+- **IMERG window:** the `precipitation` variable has axis order (time, lon, lat). The Luzon window is 32 x 49 = 1,568 cells, read in about 0.9 seconds, plus 0.6 seconds to open. The Nov 12 window mean (37.5 mm/day) and maximum (246.6 mm/day) match the earlier box check.
+- **Estimate:** about 5.5 minutes per event window (168 SMAP files and 21 IMERG files), read one after another. That fits inside Lambda's 15-minute limit. This comes from single measurements, probably over HTTPS, so it will be measured again inside the Lambda.
+
+**Findings**
+
+- `sm_rootzone_pctl` is a percentile (0 to 100) of root-zone soil moisture. NASA's percentile conversion uses a static climatology data set. It is not yet known whether that reference varies through the year, so it may or may not replace a self-built seasonal baseline.
+- SMAP L4 relies on a land model alone during instrument outages (19 June to 23 July 2019 and 6 August to 20 September 2022). Storm events in those windows need flagging.
+
+**Next:** decide the output file format, store the Earthdata login in Parameter Store, then create the Lambda role and function.
+
 ## Known limitations
 
 - SMAP L4 is partly model output, not purely observed.
+- SMAP L4 is model-only during instrument outages (June to July 2019, August to September 2022), and these overlap typhoon season.
+- SMAP (9 km grid) and IMERG (0.1 degree grid) use different grids, so combining them needs a decision (regridding or aggregation).
 - IMERG is less accurate over complex terrain and coasts.
 - IMERG includes ocean cells, so a land mask is needed so both datasets cover the same places.
 - IBTrACS only tracks cyclones, so non-storm rain events (monsoon, shear lines) are not included.
@@ -87,7 +110,9 @@ Set up the bucket prefixes and ran a pilot search for one day of Typhoon Vamco (
 
 - [x] AWS account, MFA, budget, IAM user, S3 bucket
 - [x] Pilot search for one day (IMERG and SMAP)
-- [ ] Find Luzon grid cells once and time one granule read
+- [x] Find Luzon grid cells and time one granule read (SMAP and IMERG)
+- [ ] Decide the output file format and write the first cut-out to S3
+- [ ] Test direct S3 access (the in-region flag reported `False` in CloudShell)
 - [ ] Store the Earthdata login in Parameter Store
 - [ ] Create the Lambda role and function
 - [ ] Download all events (about 78 storms)
