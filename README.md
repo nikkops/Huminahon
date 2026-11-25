@@ -35,9 +35,9 @@ After a typhoon or flood event, how many days until root-zone soil moisture retu
 ## AWS design
 
 - **Region:** `us-west-2`, where NASA Earthdata Cloud data is hosted.
-- **Storage:** one S3 bucket with these prefixes: `raw/smap/`, `raw/imerg/`, `raw/ibtracs/`, `reference/`, `processed/`, `athena-results/`, `models/`. The dashboard goes in its own small bucket.
-- **Ingestion:** one job per storm event (a Lambda function), so failures stay isolated, jobs can run in parallel and a single event can be retried.
-- **Secrets and permissions:** the Earthdata login is kept in Parameter Store (SecureString). Code uses an IAM role with least-privilege permissions, not access keys.
+- **Storage:** one S3 bucket with these prefixes: `raw/smap/`, `raw/imerg/`, `raw/ibtracs/`, `reference/`, `processed/`, `athena-results/`, `models/`, `artifacts/layers/`. The dashboard goes in its own small bucket.
+- **Ingestion:** one job per storm event (a Lambda function), so failures stay isolated, jobs can run in parallel and a single event can be retried. The function gets its libraries (numpy, h5py, earthaccess) from a Lambda layer.
+- **Secrets and permissions:** the Earthdata username and password are kept in Parameter Store (username as String, password as SecureString). Code uses an IAM role (`huminahon-ingest-lambda-role`) with least-privilege permissions, not access keys.
 - **Later:** Parquet files queried with Glue and Athena, modelling, a static dashboard served through CloudFront, and infrastructure as code.
 
 ## Key decisions
@@ -48,7 +48,7 @@ After a typhoon or flood event, how many days until root-zone soil moisture retu
 - **SMAP day filter:** keep a granule only if its start time falls on the target date. Searching by date range also returns the previous day's last window.
 - **Land mask:** SMAP water cells hold the fill value -9999, so land cells are the ones that are not -9999. The mask is built once, because the grid is the same in every file.
 - **Output granularity:** one file per day in `raw/`, to avoid thousands of tiny files that slow Athena down. A consolidated layer in `processed/` is planned.
-- **Output file format:** not decided yet. Parquet (one row per cell per timestamp) is the leading option, because Athena and Glue read it natively.
+- **Output file format:** not final. The ingestion Lambda has no pandas or pyarrow (they pushed the package past Lambda's 250 MB limit), so the leading plan is a plain NumPy file (`.npz`) per day in `raw/`, with a separate later step converting to Parquet (one row per cell per timestamp) in `processed/`, because Athena and Glue read Parquet natively.
 
 ## Updates
 
@@ -95,6 +95,46 @@ Finished the pilot reads for both datasets on one day of Typhoon Vamco, in AWS C
 
 **Next:** decide the output file format, store the Earthdata login in Parameter Store, then create the Lambda role and function.
 
+### Checkpoint 4
+
+Stored the Earthdata login in Parameter Store, created the Lambda role and function, and got the dependency layer working.
+
+**What was built**
+
+- **Parameter Store:** two parameters under a `/huminahon/earthdata/` path, the username as a String and the password as a SecureString (free on the Standard tier, encrypted with the default AWS-managed key). Parameter Store was chosen over Secrets Manager because it costs nothing for this use.
+- **Lambda role:** `huminahon-ingest-lambda-role`, trusted by `lambda.amazonaws.com`, plus the basic execution policy for logs. Its inline policy allows only: read and write objects under `raw/*`, list the bucket limited to the `raw/` prefix, and read parameters under the Earthdata path. Nothing else.
+- **Lambda function:** `huminahon-ingest`, with a first test that read both parameters (decrypting the password) and returned only their lengths, so the login itself is never printed or logged.
+- **Layer:** `huminahon-deps` (version 1), built in CloudShell with `pip install earthaccess h5py numpy --target ./python`, zipped (about 49 MB, 139 MB unzipped), uploaded to `artifacts/layers/` in the bucket, then created from that S3 location in Copy mode. Compatible with Python 3.13 and x86_64.
+- **Import test:** numpy 2.5.5, h5py 3.16.0 and earthaccess 1.0.0 all import from the layer. The run took about 2 seconds and used 126 MB of the 1,024 MB configured.
+
+**Lessons**
+
+- The first build (with pandas and pyarrow) was 389 MB unzipped, over Lambda's 250 MB limit for function plus layers. Dropping pandas and pyarrow from the ingestion step brought it to 139 MB. Parquet conversion moves to a separate step later.
+- A layer must match the Lambda's Python version and CPU architecture. CloudShell had Python 3.13 while the function defaulted to a newer runtime, so the function's runtime was changed to 3.13 instead of rebuilding the layer.
+- A layer over 50 MB cannot go through the console's direct upload, so it goes via S3 first.
+- Lambda roles give temporary credentials, so no access keys are stored anywhere.
+
+## Open questions for the next session
+
+**Ingestion function design**
+- What does the function receive as input, and what in it says which event and which days to fetch?
+- What is the S3 key layout for one day's output, and which S3 call lets the function check "already done" so it can skip (making reruns safe)?
+- What is written when a day fails or has no data, so a later run can tell the difference between "not done" and "nothing there"?
+
+**Reading the data**
+- Does direct S3 access work from inside Lambda? (The in-region check said `False` in CloudShell and was never tested. Try `earthaccess.get_s3_filesystem`.)
+- How long does one event take inside Lambda, compared with the 5.5 minute estimate? Does the timeout (15 minutes at most) and memory need to change from the current settings?
+
+**Data and modelling**
+- Is the `sm_rootzone_pctl` climatology seasonal, or can it not replace a self-built baseline?
+- How are SMAP (9 km) and IMERG (0.1 degree) put on a common grid, and how is the land mask applied to IMERG?
+- How are events inside the SMAP outage windows (2019 and 2022) flagged?
+
+**AWS housekeeping**
+- Was the `iam:PassRole` policy for the builder group actually saved? (The function was created fine, so it may already work.)
+- How are all 78 events run, and how are failures tracked (SQS with a dead-letter queue, or Step Functions)?
+- Should the layer build commands go into the repo so the layer can be rebuilt?
+
 ## Known limitations
 
 - SMAP L4 is partly model output, not purely observed.
@@ -113,8 +153,8 @@ Finished the pilot reads for both datasets on one day of Typhoon Vamco, in AWS C
 - [x] Find Luzon grid cells and time one granule read (SMAP and IMERG)
 - [ ] Decide the output file format and write the first cut-out to S3
 - [ ] Test direct S3 access (the in-region flag reported `False` in CloudShell)
-- [ ] Store the Earthdata login in Parameter Store
-- [ ] Create the Lambda role and function
+- [x] Store the Earthdata login in Parameter Store
+- [x] Create the Lambda role and function, with a working dependency layer
 - [ ] Download all events (about 78 storms)
 - [ ] Convert to Parquet, query with Athena
 - [ ] Seasonal baselines and recovery-time target
